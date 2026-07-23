@@ -1,0 +1,30 @@
+# --- Python caches / bytecode ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs ---
+.venv/
+venv/
+env/
+
+# --- Secrets / local env ---
+.env
+.env.*
+!.env.example
+
+# --- Editor / OS cruft ---
+.vscode/
+.idea/
+.DS_Store
+
+# --- Runtime data (SQLite cache, not source) ---
+data/image_cache.db
+data/image_cache.db-wal
+data/image_cache.db-shm
+
+# --- Build output (packaged tarballs, not source) ---
+dist/

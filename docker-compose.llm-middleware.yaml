@@ -1,0 +1,122 @@
+# docker-compose.llm-middleware.yaml
+#
+# Placement: /opt/giwg_scripts/llm-middleware/docker-compose.llm-middleware.yaml
+# Included from the main compose file (in /opt/docker/GIWG) by ABSOLUTE path:
+#
+#   include:
+#     - docker-compose.proxy.yaml
+#     - docker-compose.gemma.yaml
+#     - docker-compose.llama.yaml
+#     - /opt/giwg_scripts/llm-middleware/docker-compose.llm-middleware.yaml
+#
+# Relative paths below (build context, volume) resolve to THIS file's directory
+# (/opt/giwg_scripts/llm-middleware), because Compose resolves an included
+# file's relative paths relative to that file (requires Compose v2.20+).
+
+services:
+  middleware:
+    # -------------------------------------------------------------- #
+    # Image (offline / air-gapped): pre-built on a connected machine and
+    # transferred as a tarball, so the server does no build step at all.
+    #   Connected machine: docker save llm-middleware:2026-07-19 -o llm-middleware-2026-07-19.tar
+    #   Server:            docker load -i llm-middleware-2026-07-19.tar
+    # The tag below must match what was loaded.
+    # -------------------------------------------------------------- #
+    image: llm-middleware:2026-07-19
+
+    # Stable, predictable container name for logs / docker exec.
+    container_name: llm-middleware
+
+    # -------------------------------------------------------------- #
+    # Networking: the middleware reaches the model backends by SERVICE NAME
+    # (http://llama:8002, http://gemma:8001), which only works if this service
+    # is on the SAME Docker network as the llama/gemma services.
+    #
+    # Since this fragment is INCLUDED into the same Compose PROJECT as the
+    # gemma/llama fragments, all services share the project's default network
+    # automatically IF none of them pin a custom network. If your gemma/llama
+    # fragments DO attach to a specific named network, uncomment and set the
+    # `networks:` blocks below to match that network so name resolution works.
+    # See the notes after this file for how to find the network name.
+    # -------------------------------------------------------------- #
+    # networks:
+    #   - giwg_net
+
+    # -------------------------------------------------------------- #
+    # Environment: only the middleware's OWN overrides. Other services'
+    # variables are NOT visible here (separate containers). Everything not set
+    # uses the correct coded defaults in app/config.py.
+    # -------------------------------------------------------------- #
+    environment:
+      # REQUIRED: set to Llama's real vLLM --max-model-len (source of truth).
+      - LLAMA_MAX_MODEL_LEN=9000
+      # Tokens reserved for the answer (prompt budget = max_model_len - this).
+      - LLAMA_RESERVED_GENERATION=1500
+      # Model-id contract OWUI sends (confirm against OWUI's model list).
+      - MODEL_ID_LLAMA=llama
+      - MODEL_ID_GEMMA=gemma
+      - MODEL_ID_AUTO=auto
+      - MODEL_ID_TASKS=tasks
+      # Secondary bg-task signal: requests without chat_id are treated as OWUI
+      # task calls. REQUIRES the chat_id-injection OWUI Filter to be installed
+      # and enabled (global scope); set to false if the Filter cannot be
+      # guaranteed, otherwise a broken Filter silently routes ALL traffic to
+      # the image model.
+      - TREAT_MISSING_CHAT_ID_AS_TASK=true
+      # Served-model-names forwarded to each vLLM (must match --served-model-name).
+      - LLAMA_SERVED_MODEL_NAME=llama
+      - GEMMA_SERVED_MODEL_NAME=gemma
+      # Service names/ports of the backends (match your gemma/llama fragments).
+      - LLAMA_HOST=llama
+      - LLAMA_PORT=8002
+      - GEMMA_HOST=gemma
+      - GEMMA_PORT=8001
+      # Logging.
+      - LOG_LEVEL=INFO
+
+    # -------------------------------------------------------------- #
+    # Persistence: the shared image-description cache and the acronym CSV live
+    # under /data. Mount THIS directory's ./data so the SQLite cache survives
+    # restarts and the acronyms.csv is available to the container.
+    #   Host: /opt/giwg_scripts/llm-middleware/data
+    #   Container: /data  (matches IMAGE_CACHE_PATH / ACRONYMS_CSV_PATH defaults)
+    #
+    # config.py override: bind-mounted (not baked into the image) so an admin
+    # can hand-edit tunables directly on the server without rebuilding/
+    # retransferring the image. A copy of app/config.py is transferred
+    # alongside the image tarball to seed this path; `docker compose restart
+    # middleware` picks up edits (Python imports it once at process start).
+    #   Host: /opt/giwg_scripts/llm-middleware/app/config.py
+    #   Container: /srv/app/config.py (read-only: the app only reads it)
+    # -------------------------------------------------------------- #
+    volumes:
+      - ./data:/data
+      - ./app/config.py:/srv/app/config.py:ro
+
+    # -------------------------------------------------------------- #
+    # Ports: expose the middleware so OWUI can reach it. OWUI's OpenAI API base
+    # URL should point at http://middleware:8080/v1 (by service name, if OWUI is
+    # in the same project/network) OR http://<host>:8080/v1 via this published
+    # port. Publishing 8080 also lets you curl /health from the host.
+    # -------------------------------------------------------------- #
+    ports:
+      - "8080:8080"
+
+    # -------------------------------------------------------------- #
+    # Healthcheck: the app serves GET /health. Uses python (present in the
+    # image) so we don't depend on curl being installed. Marks the container
+    # healthy once the app is serving.
+    # -------------------------------------------------------------- #
+    healthcheck:
+      test:
+        - "CMD"
+        - "python"
+        - "-c"
+        - "import urllib.request,sys; sys.exit(0) if urllib.request.urlopen('http://localhost:8080/health', timeout=3).status==200 else sys.exit(1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    # Restart on failure, but not if explicitly stopped.
+    restart: unless-stopped

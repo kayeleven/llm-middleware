@@ -1,0 +1,40 @@
+# --- Python caches / bytecode ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtualenvs (never ship a host venv into the image) ---
+.venv/
+venv/
+env/
+
+# --- VCS / editor / OS cruft ---
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# --- Docker / compose (not needed inside the image) ---
+Dockerfile
+.dockerignore
+docker-compose*.yaml
+docker-compose*.yml
+
+# --- Runtime data: DO NOT bake the SQLite cache into the image ---
+# The image should ship with an EMPTY /data (created by the Dockerfile) and get
+# its real, persistent data from the mounted ./data volume at runtime. Baking a
+# stale cache in would confuse persistence and bloat the image.
+data/image_cache.db
+data/image_cache.db-wal
+data/image_cache.db-shm
+
+# NOTE: We do NOT ignore wheels/ or requirements.txt — they are REQUIRED in the
+# build context for the offline install. We DO NOT ignore app/ — it is the code.
+# acronyms.csv: keep it OUT of the image (ship via the ./data volume) unless you
+# specifically want a baseline CSV baked in; ignore it here to force the volume
+# to be the source of truth.
+data/acronyms.csv

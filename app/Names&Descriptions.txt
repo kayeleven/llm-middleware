@@ -1,0 +1,2 @@
+LAMA-LOGIC	“Big Brain. Short Notes.”
+GEMMA-GUIDE	“Quick Answers Across Text, Maps, and Images.”

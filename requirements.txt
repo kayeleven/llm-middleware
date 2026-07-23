@@ -1,0 +1,37 @@
+# =====================================================================
+# LLM Wargame Middleware — pinned dependencies
+#
+# Air-gapped build rules:
+#   - EXACT pins (==) only. No ranges. Reproducibility over freshness.
+#   - Vendor these (and their transitive deps) as wheels on the download
+#     network, then install offline in the Dockerfile:
+#       pip download -r requirements.txt -d ./wheels \
+#         --platform manylinux2014_x86_64 --python-version 3.12 \
+#         --only-binary=:all:
+#       (in Dockerfile) pip install --no-index --find-links=/wheels -r requirements.txt
+#
+# NOTE: pip download will also fetch TRANSITIVE dependencies (starlette,
+# pydantic-core, anyio, sniffio, h11, httpcore, certifi, idna, typing_extensions,
+# annotated-types, click, etc.) into ./wheels automatically. You do not list
+# them here; they are pulled and vendored as part of resolving these top-level
+# pins. Do NOT hand-pin transitives unless you hit a resolver conflict.
+# =====================================================================
+
+# --- Web framework + ASGI server -------------------------------------
+# FastAPI provides the app, routing, Request, and StreamingResponse we use.
+fastapi==0.115.0
+# Uvicorn runs the ASGI app (the Dockerfile CMD calls uvicorn app.main:app).
+# [standard] pulls uvloop + httptools for better performance.
+uvicorn[standard]==0.30.6
+
+# --- Configuration ----------------------------------------------------
+# pydantic-settings backs app/config.py (BaseSettings, SettingsConfigDict,
+# field_validator via pydantic). pydantic v2 is pulled transitively but we pin
+# it explicitly to lock the major version the code targets.
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# --- Async HTTP client ------------------------------------------------
+# httpx is the async client for all vLLM backend calls (chat, tokenize,
+# describe, summarize) and the streaming (aiter_bytes) in backends.py.
+httpx==0.27.2
