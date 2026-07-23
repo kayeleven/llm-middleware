@@ -33,12 +33,13 @@ import asyncio
 import hashlib
 import json
 import logging
+import uuid
 from typing import Any, AsyncIterator, Optional
 
 import httpx
 from fastapi import Request
 
-from app import backends, images, terminology
+from app import backends, chatlog, images, terminology
 from app.routing import (
     Reason,
     Target,
@@ -206,6 +207,7 @@ async def _finish(
     messages: list[Message],
     *,
     stream_requested: bool,
+    log_ctx: Optional[chatlog.LogContext] = None,
     **kwargs,
 ):
     """
@@ -217,10 +219,30 @@ async def _finish(
     collect_response is a plain coroutine and IS awaited here. Callers
     uniformly write `return await _finish(...)` and receive either the SSE
     async generator or the assembled chat.completion dict.
+
+    Chat logging (log_ctx, optional): this is the single choke point every
+    routing outcome dispatches through, and by now `target` is FINAL (unlike
+    the preliminary decision from decide_target(), which can still be
+    superseded by an oversize/Llama-unavailable divert) — so it is the
+    correct place to anchor both the REQUEST and RESPONSE log events.
+    log_ctx is None for calls that must never be logged (OWUI background
+    tasks; see process_request's Branch B0).
     """
+    if log_ctx is not None:
+        _spawn_background(chatlog.log_request(log_ctx))
+
     if stream_requested:
-        return stream_response(request, target, messages, **kwargs)
-    return await collect_response(request, target, messages, **kwargs)
+        stream = stream_response(request, target, messages, **kwargs)
+        if log_ctx is None:
+            return stream
+        # Tee: forwards every chunk unchanged, logs the assembled RESPONSE
+        # event once the stream ends (see chatlog.tee_and_log_stream).
+        return chatlog.tee_and_log_stream(stream, log_ctx, target)
+
+    result = await collect_response(request, target, messages, **kwargs)
+    if log_ctx is not None:
+        _spawn_background(chatlog.log_response_from_result(log_ctx, target, result))
+    return result
 
 
 async def _divert_to_gemma(
@@ -229,8 +251,11 @@ async def _divert_to_gemma(
     text_messages: list[Message],
     scan_text: str,
     user_notice: Optional[str],
+    reason: Reason,
     stream_requested: bool,
     extra: Optional[dict],
+    identity: chatlog.RequestIdentity,
+    image_rewrite_count: int,
 ) -> AsyncIterator[bytes]:
     """
     Shared Gemma-fallback path for a Llama-bound request that cannot proceed on
@@ -242,6 +267,12 @@ async def _divert_to_gemma(
         gemma_tail = build_gemma_tail(state)
     gemma_payload = _with_terminology(gemma_tail, scan_text)
 
+    log_ctx = identity.log_context(Target.GEMMA, reason, scan_text)
+    if image_rewrite_count:
+        _spawn_background(
+            chatlog.log_image_event(log_ctx, "history_rewrite", image_rewrite_count)
+        )
+
     return await _finish(
         request,
         Target.GEMMA,
@@ -252,6 +283,7 @@ async def _divert_to_gemma(
         user_notice=user_notice,
         extra=extra,
         allow_length_handoff=False,
+        log_ctx=log_ctx,
     )
 
 
@@ -267,6 +299,19 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
     """
     messages = _extract_messages(body)
     conv_key = _conversation_key(body, messages)
+
+    # Chat-log identity: constant for the whole request, reused across
+    # whichever branch ultimately dispatches (see chatlog.RequestIdentity).
+    # user_id is pseudonymized immediately on read; the raw value is never
+    # held beyond this line. group_ids: a user can belong to more than one.
+    group_ids = body.get("group_ids")
+    identity = chatlog.RequestIdentity(
+        correlation_id=uuid.uuid4().hex,
+        conv_key=conv_key,
+        pseudo_user=chatlog.pseudonymize(body.get("user_id")),
+        group_ids=group_ids if isinstance(group_ids, list) else [],
+        model_requested=body.get("model") or "",
+    )
 
     # OpenAI spec: stream defaults to FALSE when omitted. OWUI sends it
     # explicitly on every captured fixture, so this default only affects
@@ -301,6 +346,11 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
         async with state.lock:
             state.history = list(messages)
 
+        log_ctx = identity.log_context(Target.GEMMA, decision.reason, scan_text)
+        _spawn_background(
+            chatlog.log_image_event(log_ctx, "native_gemma", images.count_images(messages))
+        )
+
         return await _finish(
             request,
             Target.GEMMA,
@@ -311,6 +361,7 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
             user_notice=decision.user_notice,             # image-divert notice (if any)
             extra=extra,
             allow_length_handoff=False,
+            log_ctx=log_ctx,
         )
 
     # =============================================================== #
@@ -324,6 +375,12 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
 
     # ---- Step 5: terminology scan text (text-only now). ----
     scan_text = _latest_user_text(text_messages)
+
+    # Chat-log divergence signal (evaluation-only, never the corpus): count
+    # images in the ORIGINAL (pre-rewrite) messages. history_has_image would
+    # always read False on text_messages, since the rewrite already replaced
+    # every image part with a text placeholder by this point.
+    image_rewrite_count = images.count_images(messages)
 
     # =============================================================== #
     # Branch B0: background task -> Gemma, STATELESS. OWUI-internal
@@ -357,6 +414,12 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
             gemma_tail = build_gemma_tail(state)
         gemma_payload = _with_terminology(gemma_tail, scan_text)
 
+        log_ctx = identity.log_context(Target.GEMMA, decision.reason, scan_text)
+        if image_rewrite_count:
+            _spawn_background(
+                chatlog.log_image_event(log_ctx, "history_rewrite", image_rewrite_count)
+            )
+
         return await _finish(
             request,
             Target.GEMMA,
@@ -367,6 +430,7 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
             user_notice=decision.user_notice,                  # None for explicit
             extra=extra,
             allow_length_handoff=False,
+            log_ctx=log_ctx,
         )
 
     # =============================================================== #
@@ -385,12 +449,16 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
             # keeps indices aligned with OWUI's stable ordering; summary state
             # (summarized_up_to / summary_text) persists across turns.
             state.history = list(text_messages)
+            cutoff_before = state.summarized_up_to  # chat-log divergence snapshot
             llama_payload = await prepare_for_llama(
                 state,
                 backends.llama_token_counter_hybrid,  # injected async counter
                 backends.summarize_chunk,             # injected async summarizer
                 reserved_overhead=term_overhead,
             )
+            summarized_this_turn = state.summarized_up_to > cutoff_before
+            cutoff_after = state.summarized_up_to
+            summary_text_snapshot = state.summary_text
         llama_payload = _with_terminology(llama_payload, scan_text, precomputed_block=term_block)
 
         # Clamp max_tokens against the exact prompt size (avoid vLLM 400).
@@ -404,6 +472,18 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
             # max_tokens=0 would make vLLM reject the request; divert instead.
             raise DoesNotFitInLlama("Prompt leaves no generation room after clamping.")
 
+        log_ctx = identity.log_context(Target.LLAMA, decision.reason, scan_text)
+        if image_rewrite_count:
+            _spawn_background(
+                chatlog.log_image_event(log_ctx, "history_rewrite", image_rewrite_count)
+            )
+        if summarized_this_turn:
+            _spawn_background(
+                chatlog.log_summarization_event(
+                    log_ctx, cutoff_before, cutoff_after, summary_text_snapshot
+                )
+            )
+
         return await _finish(
             request,
             Target.LLAMA,
@@ -416,6 +496,7 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
             user_notice=None,                # explicit/auto Llama: silent
             extra=extra,
             allow_length_handoff=True,
+            log_ctx=log_ctx,
         )
 
     except DoesNotFitInLlama:
@@ -423,8 +504,8 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
         logger.info("Request does not fit in Llama; diverting to Gemma.")
         divert = oversize_divert_decision()
         return await _divert_to_gemma(
-            request, state, text_messages, scan_text, divert.user_notice,
-            stream_requested, extra,
+            request, state, text_messages, scan_text, divert.user_notice, divert.reason,
+            stream_requested, extra, identity, image_rewrite_count,
         )
 
     except (httpx.HTTPError, ValueError) as exc:
@@ -439,6 +520,6 @@ async def process_request(body: dict, request: Request) -> AsyncIterator[bytes] 
         logger.error("Llama sizing call failed (%s); failing safe to Gemma.", exc)
         divert = llama_unavailable_divert_decision()
         return await _divert_to_gemma(
-            request, state, text_messages, scan_text, divert.user_notice,
-            stream_requested, extra,
+            request, state, text_messages, scan_text, divert.user_notice, divert.reason,
+            stream_requested, extra, identity, image_rewrite_count,
         )

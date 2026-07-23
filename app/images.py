@@ -160,6 +160,16 @@ def history_has_image(messages: list[Message]) -> bool:
     return False
 
 
+def count_images(messages: list[Message]) -> int:
+    """Total number of image parts across all messages (chat-log divergence-event helper)."""
+    count = 0
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            count += sum(1 for p in content if _is_image_part(p))
+    return count
+
+
 def _iter_current_turn_images(
     messages: list[Message],
 ) -> Iterable[tuple[bytes, Optional[str]]]:

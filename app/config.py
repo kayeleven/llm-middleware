@@ -22,7 +22,7 @@ Context-budget model (IMPORTANT — read this):
 
 from __future__ import annotations
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -196,6 +196,34 @@ class Settings(BaseSettings):
     # Logging
     # ------------------------------------------------------------------ #
     LOG_LEVEL: str = "INFO"
+
+    # ------------------------------------------------------------------ #
+    # Chat logging (post-event analysis; see app/chatlog.py)
+    # ------------------------------------------------------------------ #
+    CHATLOG_ENABLED: bool = True
+
+    # One JSONL file per LOCAL calendar day is created under this directory.
+    CHATLOG_DIR: str = "/data/chat_logs"
+
+    # Salt for HMAC-SHA256 pseudonymization of the OWUI Filter-supplied
+    # user_id. Required (validated below) whenever CHATLOG_ENABLED is true —
+    # an empty salt would mean unsalted (effectively reversible) pseudonyms.
+    CHATLOG_PSEUDONYM_SALT: str = ""
+
+    @model_validator(mode="after")
+    def _validate_chatlog_salt(self) -> "Settings":
+        """
+        Fail loudly at boot if logging is enabled without a salt, rather than
+        silently producing unsalted pseudonyms at runtime (same "clear
+        boot-time failure over subtle runtime misbehavior" philosophy as
+        SUMMARY_CHUNK_FRACTION's validator above).
+        """
+        if self.CHATLOG_ENABLED and not self.CHATLOG_PSEUDONYM_SALT:
+            raise ValueError(
+                "CHATLOG_PSEUDONYM_SALT must be set when CHATLOG_ENABLED is "
+                "true (pseudonymization would otherwise be unsalted)."
+            )
+        return self
 
     # ================================================================== #
     # Derived values (single source of truth; computed, never stored)
